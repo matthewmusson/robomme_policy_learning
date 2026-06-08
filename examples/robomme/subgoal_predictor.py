@@ -15,6 +15,7 @@ from subgoal_prediction.gemini.prompts import (
 
 from subgoal_prediction.qwenvl.api import Qwen3VLModel
 from subgoal_prediction.qwenvl.api_memer import Qwen3VLModelMemER
+from subgoal_prediction.qwenvl.api_memory import Qwen3VLModelMemory
 
 
 LONG_FIRST_ACTION_TASKS = [
@@ -76,6 +77,19 @@ class SubgoalPredictorBase:
 
     def end_episode(self, epstate: EpisodeState, success_flag: str) -> None:
         pass
+
+    def get_last_vlm_call(self) -> Optional[dict]:
+        """Metadata about the most recent VLM forward, for structured
+        tracing. Returns None for predictors that don't call a VLM
+        (oracle / null), or until the first call has happened."""
+        return None
+
+    def get_prompt_template(self) -> Optional[dict]:
+        """The system prompt + user-prompt template (with placeholders)
+        used at inference time. Stamped once per episode at the top of
+        trace.json so downstream analysis knows exactly what the VLM was
+        being asked. Returns None for predictors that don't prompt a VLM."""
+        return None
 
 
 class NullSubgoalPredictor(SubgoalPredictorBase):
@@ -163,7 +177,13 @@ class QwenVLSubgoalPredictor(SubgoalPredictorBase):
         
     def start_episode(self, epstate: EpisodeState, env_runner: EnvRunner) -> None:
         super().start_episode(epstate, env_runner)
-        self.episode_dir = os.path.join(self.save_dir, self.env_name, f"ep{self.episode_id}")
+        # Use a sub-folder so the `shutil.rmtree(self.episode_dir)` in
+        # end_episode only wipes the predictor's per-step PNG dumps, not
+        # the StructuredTraceRecorder's trace.json+frames/ that live at
+        # {save_dir}/{task}/ep{N}/.
+        self.episode_dir = os.path.join(
+            self.save_dir, self.env_name, f"ep{self.episode_id}", "_predictor_workdir"
+        )
         self.api.start_new_episode(self.episode_dir, epstate.image_buffer[:-1], self.task_goal)
 
     def step(self, epstate: EpisodeState) -> None:
@@ -192,7 +212,43 @@ class QwenVLSubgoalPredictor(SubgoalPredictorBase):
         response = self.api.call(self.video_buffer[-1], count, keep_period)
         self.video_buffer.clear()
         return response, False
-    
+
+    def get_last_vlm_call(self) -> Optional[dict]:
+        raw = getattr(self.api, "last_response", None)
+        if raw is None:
+            return None
+        return {
+            "raw_response": raw,
+            "subgoal_clean": raw,  # SimpleSG/GroundSG: response IS the subgoal
+        }
+
+    def get_prompt_template(self) -> Optional[dict]:
+        is_simple = self.args.subgoal_type == "simple_subgoal"
+        subgoal_word = "language" if is_simple else "grounded language"
+        system = (
+            f"You are a helpful assistant to help guide the robot to complete the task "
+            f"by predicting a sequence of {subgoal_word} subgoals"
+        )
+        user_initial = (
+            "{video_prefix}The task goal is: {task_goal}\n"
+            "This is the initial turn for prediction\n"
+            f"<image>What's the next {subgoal_word} subgoal based on current observation?"
+        )
+        user_with_history = (
+            "{video_prefix}The task goal is: {task_goal}\n"
+            f"The history of previous predicted {subgoal_word} subgoals are: "
+            "{history_subgoals}\n"
+            f"<image>What's the next {subgoal_word} subgoal based on current observation?"
+        )
+        return {
+            "system": system,
+            "user_template_initial_turn": user_initial,
+            "user_template_with_history": user_with_history,
+            "expected_response_format": "<subgoal_text>",
+            "predictor": "qwenvl",
+            "subgoal_type": self.args.subgoal_type,
+        }
+
     def end_episode(self, epstate: EpisodeState, success_flag: str) -> None:
         if self.episode_dir:
             shutil.rmtree(self.episode_dir) # save some space, you can comment this function out to keep all video frames
@@ -205,7 +261,9 @@ class MemERSubgoalPredictor(SubgoalPredictorBase):
     
     def start_episode(self, epstate: EpisodeState, env_runner: EnvRunner) -> None:
         super().start_episode(epstate, env_runner)
-        self.episode_dir = os.path.join(self.save_dir, self.env_name, f"ep{self.episode_id}")
+        self.episode_dir = os.path.join(
+            self.save_dir, self.env_name, f"ep{self.episode_id}", "_predictor_workdir"
+        )
         self.api.start_new_episode(self.episode_dir, epstate.image_buffer[:-1], self.task_goal)
 
     def step(self, epstate: EpisodeState) -> None:
@@ -225,11 +283,161 @@ class MemERSubgoalPredictor(SubgoalPredictorBase):
             shutil.rmtree(self.episode_dir) # save some space, you can comment this function out to keep all video frames
 
 
+class MemorySubgoalPredictor(SubgoalPredictorBase):
+    """Memory-augmented Qwen3-VL subgoal predictor (our v2 variants).
+
+    `with_history` toggles between the two trained variants:
+      * True  -> v2-history (history line + memory)
+      * False -> v2-only    (memory only, no numbered history)
+    """
+
+    with_history: bool = True
+
+    def setup_api(self) -> None:
+        adapter_path = (
+            self.args.memory_history_adapter_path
+            if self.with_history
+            else self.args.memory_only_adapter_path
+        )
+        # memory_style ∈ {simple, layout, grounded, dual} — must match what the
+        # adapter was trained on (build_memory_subgoal_jsonl.py --memory-style).
+        # For dual, text_style further selects which textual action memory was
+        # paired with the spatial memory (--text-style at training time). The
+        # API derives system_prompt + subgoal_type + wording from the pair.
+        text_style = getattr(self.args, "text_style", "present")
+        self.api = Qwen3VLModelMemory(
+            adapter_path=adapter_path,
+            with_history=self.with_history,
+            memory_style=self.args.memory_style,
+            text_style=text_style,
+        )
+        ts_blurb = (
+            f", text_style={text_style}" if self.args.memory_style == "dual" else ""
+        )
+        print(
+            f"[robomme] Memory ({'history' if self.with_history else 'only'}, "
+            f"memory_style={self.args.memory_style}{ts_blurb}) agent setup finished"
+        )
+
+    def start_episode(self, epstate: EpisodeState, env_runner: EnvRunner) -> None:
+        super().start_episode(epstate, env_runner)
+        self.episode_dir = os.path.join(
+            self.save_dir, self.env_name, f"ep{self.episode_id}", "_predictor_workdir"
+        )
+        self.api.start_new_episode(self.episode_dir, epstate.image_buffer[:-1], self.task_goal)
+
+    def step(self, epstate: EpisodeState) -> None:
+        self.video_buffer.append(epstate.image_buffer[-1])
+
+    def get_subgoal(
+        self,
+        count: int,
+        current_subgoal: Optional[str],
+        last_subgoal: Optional[str],
+    ) -> Tuple[Optional[str], bool]:
+        # Snapshot pre-call memories so we can record m_t -> m_{t+1}.
+        self._last_memory_in = self.api.current_memory
+        self._last_spatial_memory_in = (
+            self.api.current_spatial_memory if self.api.uses_spatial else None
+        )
+        response = self.api.call(self.video_buffer[-1], count, keep_period=0)
+        self.video_buffer.clear()
+        return response, False
+
+    def get_last_vlm_call(self) -> Optional[dict]:
+        raw = getattr(self.api, "last_response", None)
+        if raw is None:
+            return None
+        # api._parse_memory_response splits subgoal vs action-memory; reuse it.
+        subgoal_clean, mem_out = self.api._parse_memory_response(raw)
+        info = {
+            "raw_response": raw,
+            "subgoal_clean": subgoal_clean,
+            "memory_in": getattr(self, "_last_memory_in", None),
+            "memory_out": mem_out,
+            "with_history": self.with_history,
+            "memory_style": self.api.memory_style,
+        }
+        if self.api.uses_spatial:
+            info["spatial_memory_in"]  = getattr(self, "_last_spatial_memory_in", None)
+            info["spatial_memory_out"] = self.api._parse_spatial_memory(raw)
+        return info
+
+    def get_prompt_template(self) -> Optional[dict]:
+        # Build templates that mirror api_memory.Qwen3VLModelMemory._user_prompt
+        # for the current memory_style.
+        sg_word = self.api._sg_word
+        uses_spatial = self.api.uses_spatial
+        action_mem_line = (
+            "The current action memory (a brief summary of relevant past events): "
+            "<mem>{memory_in}</mem>"
+        ) if uses_spatial else (
+            "The current memory (a brief summary of relevant past events): "
+            "<mem>{memory_in}</mem>"
+        )
+        spatial_mem_line = (
+            "\nThe current spatial memory (a description of the current scene): "
+            "<spatial_mem>{spatial_memory_in}</spatial_mem>"
+        ) if uses_spatial else ""
+
+        if self.with_history:
+            user_initial = (
+                "{video_prefix}The task goal is: {task_goal}\n"
+                "This is the initial turn for prediction\n"
+                + action_mem_line + spatial_mem_line + "\n"
+                f"<image>What's the next {sg_word} subgoal based on current observation?"
+            )
+            user_with_history = (
+                "{video_prefix}The task goal is: {task_goal}\n"
+                f"The history of previous predicted {sg_word} subgoals are: "
+                "{history_subgoals}\n"
+                + action_mem_line + spatial_mem_line + "\n"
+                f"<image>What's the next {sg_word} subgoal based on current observation?"
+            )
+        else:
+            user_initial = (
+                "{video_prefix}The task goal is: {task_goal}\n"
+                + action_mem_line + spatial_mem_line + "\n"
+                f"<image>What's the next {sg_word} subgoal based on current observation?"
+            )
+            user_with_history = user_initial
+        expected_response = (
+            "<subgoal_text>\\n<mem>{memory_out}</mem>\\n<spatial_mem>{spatial_memory_out}</spatial_mem>"
+            if uses_spatial else
+            "<subgoal_text>\\n<mem>{memory_out}</mem>"
+        )
+        return {
+            "system": self.api.system_prompt,
+            "user_template_initial_turn": user_initial,
+            "user_template_with_history": user_with_history,
+            "expected_response_format": expected_response,
+            "predictor": "memory_history" if self.with_history else "memory_only",
+            "with_history": self.with_history,
+            "memory_style": self.args.memory_style,
+            "subgoal_type": self.api.subgoal_type,
+            "uses_spatial": uses_spatial,
+            "initial_memory": "No actions had been completed yet.",
+            "initial_spatial_memory": "No observations yet." if uses_spatial else None,
+        }
+
+    def end_episode(self, epstate: EpisodeState, success_flag: str) -> None:
+        if self.episode_dir:
+            shutil.rmtree(self.episode_dir)
+
+
+class MemoryHistorySubgoalPredictor(MemorySubgoalPredictor):
+    with_history = True
+
+
+class MemoryOnlySubgoalPredictor(MemorySubgoalPredictor):
+    with_history = False
+
+
 class OracleSubgoalPredictor(SubgoalPredictorBase):
-    
+
     def setup_api(self) -> None:
         print("[robomme] Oracle agent setup finished")
-    
+
     def get_subgoal(
         self,
         count: int,
@@ -237,9 +445,27 @@ class OracleSubgoalPredictor(SubgoalPredictorBase):
         last_subgoal: Optional[str],
     ) -> Tuple[Optional[str], bool]:
         if self.args.subgoal_type == "simple_subgoal":
-            return self.env_runner.simple_subgoal_oracle, False
+            sg = self.env_runner.simple_subgoal_oracle
         else:
-            return self.env_runner.grounded_subgoal_oracle, False
+            sg = self.env_runner.grounded_subgoal_oracle
+        self._last_oracle_subgoal = sg
+        return sg, False
+
+    def get_last_vlm_call(self) -> Optional[dict]:
+        sg = getattr(self, "_last_oracle_subgoal", None)
+        if sg is None:
+            return None
+        return {"raw_response": sg, "subgoal_clean": sg, "source": "oracle"}
+
+    def get_prompt_template(self) -> Optional[dict]:
+        return {
+            "predictor": "oracle",
+            "subgoal_type": self.args.subgoal_type,
+            "note": (
+                "Oracle: subgoals come directly from the sim "
+                "(env_runner.{simple|grounded}_subgoal_oracle); no VLM prompt."
+            ),
+        }
 
 
 def build_subgoal_predictor(
@@ -252,6 +478,10 @@ def build_subgoal_predictor(
         return QwenVLSubgoalPredictor(args, save_dir)
     if args.use_memer:
         return MemERSubgoalPredictor(args, save_dir)
+    if getattr(args, "use_memory_history", False):
+        return MemoryHistorySubgoalPredictor(args, save_dir)
+    if getattr(args, "use_memory_only", False):
+        return MemoryOnlySubgoalPredictor(args, save_dir)
     if args.use_oracle:
         return OracleSubgoalPredictor(args, save_dir)
     

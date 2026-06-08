@@ -34,10 +34,16 @@ class Qwen3VLModel:
             raise ValueError(f"Invalid subgoal type: {subgoal_type}")
         
         print(f"Loading Qwen3-VL-4B-Instruct model Adapter from {adapter_path}")
+        base_model = (
+            "/vol/qwen3-vl-4b-instruct"
+            if os.path.isdir("/vol/qwen3-vl-4b-instruct")
+            else "Qwen/Qwen3-VL-4B-Instruct"
+        )
+        print(f"[Qwen3VLModel] base model: {base_model}")
         self.engine = PtEngine(
-            model_id_or_path='Qwen/Qwen3-VL-4B-Instruct',
+            model_id_or_path=base_model,
             adapters=[adapter_path],
-            attn_impl='flash_attention_2' #'sdpa'
+            attn_impl='sdpa'  # flash_attention_2 requires a 20-30 min build; sdpa is the official fallback per readme
         )
         
     def _parse_box_patterns(self, subgoal: str, replacement: str = "scaled_coords", return_bbox: bool = False):
